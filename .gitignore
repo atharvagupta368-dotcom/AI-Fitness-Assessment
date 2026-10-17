@@ -7,3 +7,5 @@ __pycache__/
 Thumbs.db
 pose_landmarker_lite.task
 squat.mp4
+
+*.task
