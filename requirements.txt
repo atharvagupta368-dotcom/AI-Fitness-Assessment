@@ -1,7 +1,5 @@
 
-opencv-python
-mediapipe==1.1.0
-numpy
 streamlit
-streamlit-webrtc
-av
+opencv-python-headless
+mediapipe==0.10.21
+numpy
