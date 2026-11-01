@@ -882,12 +882,16 @@ if (
 
     st.video(video_bytes)
 
+   
     st.download_button(
-        "Download Assessed Video",
-        data=video_bytes,
-        file_name="assessed_video.mp4",
-        mime="video/mp4"
-    )
+    label="⬇️ Download Assessed Video",
+    data=video_bytes,
+    file_name="assessed_video.mp4",
+    mime="video/mp4",
+    on_click="ignore",
+    type="primary"
+)
+
 
     st.caption(
         "This is a basic computer-vision demonstration. "
