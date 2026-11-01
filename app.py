@@ -1,388 +1,896 @@
 
-import math
-import os
-import time
-
-import av
 import cv2
-import mediapipe as mp
+import time
+import tempfile
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
+import mediapipe as mp
+
+from pathlib import Path
+from collections import deque
 
 
-MODEL_PATH = "pose_landmarker_lite.task"
-DOWN_ANGLE = 115
-UP_ANGLE = 155
-VISIBILITY_THRESHOLD = 0.5
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 st.set_page_config(
     page_title="AI Fitness Assessment",
-    page_icon="🏋️",
-    layout="wide",
+    page_icon="💪",
+    layout="wide"
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "pose_landmarker_lite.task"
+
+EXERCISES = [
+    "Squats",
+    "Push-ups",
+    "Bicep Curls",
+    "Lateral Raises"
+]
+
+VISIBILITY_THRESHOLD = 0.5
+
+# Landmark indexes
+LS, RS = 11, 12
+LE, RE = 13, 14
+LW, RW = 15, 16
+LH, RH = 23, 24
+LK, RK = 25, 26
+LA, RA = 27, 28
+
+CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15),
+    (12, 14), (14, 16), (11, 23),
+    (12, 24), (23, 24), (23, 25),
+    (25, 27), (24, 26), (26, 28),
+    (15, 17), (15, 19), (15, 21),
+    (16, 18), (16, 20), (16, 22)
+]
+
+THRESHOLDS = {
+    "Squats": {"down": 115, "up": 155},
+    "Push-ups": {"down": 90, "up": 150},
+    "Bicep Curls": {"up": 60, "down": 140},
+    "Lateral Raises": {"up": 55, "down": 25}
+}
+
+
+# =========================================================
+# ANGLE CALCULATIONS
+# =========================================================
 
 def calculate_angle(a, b, c):
-    a = np.array(a, dtype=float)
-    b = np.array(b, dtype=float)
-    c = np.array(c, dtype=float)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    c = np.asarray(c, dtype=float)
 
     ba = a - b
     bc = c - b
 
     denominator = np.linalg.norm(ba) * np.linalg.norm(bc)
-    if denominator == 0:
+
+    if denominator < 1e-8:
         return None
 
     cosine = np.dot(ba, bc) / denominator
-    return math.degrees(
-        math.acos(np.clip(cosine, -1.0, 1.0))
+    cosine = np.clip(cosine, -1.0, 1.0)
+
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def get_point(landmark):
+    return (landmark.x, landmark.y)
+
+
+def visible(landmarks, indices):
+    return all(
+        landmarks[i].visibility >= VISIBILITY_THRESHOLD
+        for i in indices
     )
 
 
-def torso_lean_from_vertical(shoulder, hip):
-    dx = shoulder[0] - hip[0]
-    dy = shoulder[1] - hip[1]
+def best_angle(landmarks, sides):
+    candidates = []
 
-    if dx == 0 and dy == 0:
+    for ids in sides:
+        if not visible(landmarks, ids):
+            continue
+
+        angle = calculate_angle(*[
+            get_point(landmarks[i]) for i in ids
+        ])
+
+        if angle is not None:
+            confidence = min(
+                landmarks[i].visibility for i in ids
+            )
+            candidates.append((angle, confidence))
+
+    if not candidates:
         return None
 
-    return abs(math.degrees(math.atan2(dx, -dy)))
+    return max(candidates, key=lambda item: item[1])[0]
 
 
-def is_visible(landmark):
-    return landmark.visibility >= VISIBILITY_THRESHOLD
+# =========================================================
+# EXERCISE MEASUREMENTS
+# =========================================================
+
+def get_measurement(landmarks, exercise):
+
+    if exercise == "Squats":
+        return best_angle(
+            landmarks,
+            [(LH, LK, LA), (RH, RK, RA)]
+        )
+
+    if exercise in ("Push-ups", "Bicep Curls"):
+        return best_angle(
+            landmarks,
+            [(LS, LE, LW), (RS, RE, RW)]
+        )
+
+    return best_angle(
+        landmarks,
+        [(LH, LS, LE), (RH, RS, RE)]
+    )
 
 
-def draw_skeleton(frame, landmarks):
+def get_torso_inclination(landmarks):
+    """
+    Estimate torso inclination relative to vertical.
+    Best suited to a side-view squat video.
+    """
+
+    if not visible(landmarks, [LS, RS, LH, RH]):
+        return None
+
+    shoulder_x = (
+        landmarks[LS].x + landmarks[RS].x
+    ) / 2
+
+    shoulder_y = (
+        landmarks[LS].y + landmarks[RS].y
+    ) / 2
+
+    hip_x = (
+        landmarks[LH].x + landmarks[RH].x
+    ) / 2
+
+    hip_y = (
+        landmarks[LH].y + landmarks[RH].y
+    ) / 2
+
+    dx = shoulder_x - hip_x
+    dy = shoulder_y - hip_y
+
+    if abs(dy) < 1e-6:
+        return 90.0
+
+    return float(np.degrees(np.arctan2(abs(dx), abs(dy))))
+
+
+# =========================================================
+# MOVEMENT CLASSIFICATION
+# =========================================================
+
+def classify_movement(angle, exercise):
+
+    if angle is None:
+        return "NOT DETECTED"
+
+    t = THRESHOLDS[exercise]
+
+    if exercise in ("Squats", "Push-ups"):
+
+        if angle <= t["down"]:
+            return "DOWN"
+
+        if angle >= t["up"]:
+            return "UP"
+
+    elif exercise == "Bicep Curls":
+
+        if angle <= t["up"]:
+            return "UP"
+
+        if angle >= t["down"]:
+            return "DOWN"
+
+    elif exercise == "Lateral Raises":
+
+        if angle >= t["up"]:
+            return "UP"
+
+        if angle <= t["down"]:
+            return "DOWN"
+
+    return "MOVING"
+
+
+# =========================================================
+# SQUAT POSTURE ASSESSMENT
+# =========================================================
+
+def assess_squat_posture(landmarks, knee_angle):
+
+    if knee_angle is None:
+        return False, "Body landmarks not detected"
+
+    torso_angle = get_torso_inclination(landmarks)
+
+    if torso_angle is None:
+        return False, "Keep your upper body visible"
+
+    # Excessive torso inclination warning.
+    # Initial threshold: validate using your own video.
+    if torso_angle > 55:
+        return False, "Keep your torso more upright"
+
+    # Squat depth is evaluated when the knees bend.
+    if knee_angle < 115:
+        return True, "Good squat depth"
+
+    # Standing position is not considered a squat-depth error.
+    if knee_angle >= 155:
+        return True, "Good standing position"
+
+    # During the movement, depth cannot be judged yet.
+    return True, "Movement detected"
+
+
+def assess_posture(landmarks, angle, exercise):
+
+    if exercise == "Squats":
+        return assess_squat_posture(landmarks, angle)
+
+    # Other exercises currently have pose tracking,
+    # but not validated red/green posture rules.
+    return None, "Posture assessment not configured"
+
+
+# =========================================================
+# REPETITION COUNTER
+# =========================================================
+
+def new_counter():
+
+    return {
+        "phase": "WAITING",
+        "reps": 0,
+        "last_count_time": -1.0
+    }
+
+
+def update_counter(state, counter, timestamp):
+
+    if state == "DOWN":
+        counter["phase"] = "DOWN"
+
+    elif state == "UP" and counter["phase"] == "DOWN":
+
+        if timestamp - counter["last_count_time"] >= 0.35:
+            counter["reps"] += 1
+            counter["last_count_time"] = timestamp
+
+        counter["phase"] = "UP"
+
+    return counter
+
+
+# =========================================================
+# DRAW SKELETON
+# =========================================================
+
+def draw_pose(frame, landmarks, posture_good):
+
     height, width = frame.shape[:2]
 
-    connections = [
-        (11, 12),
-        (11, 13), (13, 15),
-        (12, 14), (14, 16),
-        (11, 23), (12, 24),
-        (23, 24),
-        (23, 25), (25, 27),
-        (24, 26), (26, 28),
-        (27, 29), (29, 31),
-        (28, 30), (30, 32),
-    ]
+    points = {}
 
-    for start, end in connections:
-        if is_visible(landmarks[start]) and is_visible(landmarks[end]):
-            x1 = int(landmarks[start].x * width)
-            y1 = int(landmarks[start].y * height)
-            x2 = int(landmarks[end].x * width)
-            y2 = int(landmarks[end].y * height)
+    for i, lm in enumerate(landmarks):
+
+        points[i] = (
+            int(lm.x * width),
+            int(lm.y * height)
+        )
+
+    if posture_good is True:
+        color = (0, 255, 0)       # GREEN
+
+    elif posture_good is False:
+        color = (0, 0, 255)       # RED
+
+    else:
+        color = (0, 165, 255)     # ORANGE: not assessed
+
+    for start, end in CONNECTIONS:
+
+        if start >= len(landmarks) or end >= len(landmarks):
+            continue
+
+        if (
+            landmarks[start].visibility >= VISIBILITY_THRESHOLD
+            and landmarks[end].visibility >= VISIBILITY_THRESHOLD
+        ):
 
             cv2.line(
-                frame, (x1, y1), (x2, y2),
-                (60, 220, 100), 3, cv2.LINE_AA
+                frame,
+                points[start],
+                points[end],
+                color,
+                3
             )
 
-    for point in landmarks:
-        if is_visible(point):
-            x = int(point.x * width)
-            y = int(point.y * height)
+    for i, point in points.items():
+
+        if landmarks[i].visibility >= VISIBILITY_THRESHOLD:
+
             cv2.circle(
-                frame, (x, y), 4,
-                (0, 220, 255), -1, cv2.LINE_AA
+                frame,
+                point,
+                5,
+                color,
+                -1
             )
 
+    return frame
 
-def draw_label(frame, text, y, color=(255, 255, 255)):
-    cv2.putText(
-        frame, text, (18, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7, color, 2, cv2.LINE_AA
+
+# =========================================================
+# VIDEO OVERLAY
+# =========================================================
+
+def draw_overlay(
+    frame,
+    exercise,
+    reps,
+    state,
+    posture_good,
+    feedback
+):
+
+    cv2.rectangle(
+        frame,
+        (10, 10),
+        (560, 180),
+        (25, 25, 25),
+        -1
     )
 
+    cv2.putText(
+        frame,
+        f"Exercise: {exercise}",
+        (22, 42),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
 
-class FitnessProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.lock = __import__("threading").Lock()
-        self.landmarker = None
-        self.timestamp_ms = 0
-        self.reps = 0
-        self.is_down = False
-        self.previous_angle = None
-        self.movement = "WAITING"
-        self.knee_angle = None
-        self.torso_angle = None
-        self.status = "POSITION YOUR BODY IN VIEW"
-        self.feedback = "Keep your full body visible."
-        self.score = 100
-        self.pose_detected = False
+    cv2.putText(
+        frame,
+        f"Repetitions: {reps}",
+        (22, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
 
-    def ensure_landmarker(self):
-        if self.landmarker is None:
-            options = mp.tasks.vision.PoseLandmarkerOptions(
-                base_options=mp.tasks.BaseOptions(
-                    model_asset_path=MODEL_PATH
-                ),
-                running_mode=mp.tasks.vision.RunningMode.VIDEO,
-                num_poses=1,
-            )
-            self.landmarker = (
-                mp.tasks.vision.PoseLandmarker
-                .create_from_options(options)
-            )
+    cv2.putText(
+        frame,
+        f"Movement: {state}",
+        (22, 112),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 220, 255),
+        2
+    )
 
-    def recv(self, video_frame):
-        frame = video_frame.to_ndarray(format="bgr24")
-        output = frame.copy()
+    if posture_good is True:
+        color = (0, 255, 0)
+        label = "POSTURE: CORRECT"
 
-        if not os.path.exists(MODEL_PATH):
-            draw_label(output, "POSE MODEL FILE NOT FOUND", 40, (0, 0, 255))
-            return av.VideoFrame.from_ndarray(output, format="bgr24")
+    elif posture_good is False:
+        color = (0, 0, 255)
+        label = "POSTURE: INCORRECT"
 
-        try:
-            self.ensure_landmarker()
+    else:
+        color = (0, 165, 255)
+        label = "POSTURE: NOT ASSESSED"
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb,
-            )
+    cv2.putText(
+        frame,
+        label,
+        (22, 145),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2
+    )
 
-            self.timestamp_ms += 33
-            result = self.landmarker.detect_for_video(
-                mp_image, self.timestamp_ms
-            )
+    cv2.putText(
+        frame,
+        feedback[:55],
+        (22, 170),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1
+    )
 
-            self.knee_angle = None
-            self.torso_angle = None
-            self.pose_detected = False
-            self.movement = "NOT DETECTED"
-            self.status = "CORRECT YOUR POSTURE"
-            self.feedback = "Step into view and show your full body."
-            self.score = 0
+    return frame
 
-            if result.pose_landmarks:
-                points = result.pose_landmarks[0]
-                draw_skeleton(output, points)
 
-                required = [12, 24, 26, 28]
+# =========================================================
+# VIDEO PROCESSING
+# =========================================================
 
-                if all(is_visible(points[i]) for i in required):
-                    self.pose_detected = True
+def process_video(input_path, output_path, exercise, progress):
 
-                    shoulder = (points[12].x, points[12].y)
-                    hip = (points[24].x, points[24].y)
-                    knee = (points[26].x, points[26].y)
-                    ankle = (points[28].x, points[28].y)
+    cap = cv2.VideoCapture(str(input_path))
 
-                    self.knee_angle = calculate_angle(
-                        hip, knee, ankle
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open uploaded video.")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 30.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError("Invalid video dimensions.")
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height)
+    )
+
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("Unable to create output video.")
+
+    options = mp.tasks.vision.PoseLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(
+            model_asset_path=str(MODEL_PATH)
+        ),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    counter = new_counter()
+
+    processed_frames = 0
+    visible_frames = 0
+
+    correct_frames = 0
+    incorrect_frames = 0
+    unassessed_frames = 0
+
+    last_state = "NOT DETECTED"
+    last_feedback = "Waiting for pose"
+
+    angle_history = deque(maxlen=5)
+
+    start_time = time.perf_counter()
+
+    try:
+
+        with mp.tasks.vision.PoseLandmarker.create_from_options(
+            options
+        ) as landmarker:
+
+            while True:
+
+                ok, frame = cap.read()
+
+                if not ok:
+                    break
+
+                processed_frames += 1
+
+                rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB
+                )
+
+                image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(rgb)
+                )
+
+                timestamp_ms = int(
+                    (processed_frames - 1) * 1000 / fps
+                )
+
+                result = landmarker.detect_for_video(
+                    image,
+                    timestamp_ms
+                )
+
+                timestamp_seconds = (
+                    processed_frames - 1
+                ) / fps
+
+                posture_good = None
+
+                if result.pose_landmarks:
+
+                    landmarks = result.pose_landmarks[0]
+                    visible_frames += 1
+
+                    angle = get_measurement(
+                        landmarks,
+                        exercise
                     )
-                    self.torso_angle = torso_lean_from_vertical(
-                        shoulder, hip
-                    )
 
-                    issues = []
+                    if angle is not None:
 
-                    if self.knee_angle is not None:
-                        if self.knee_angle < DOWN_ANGLE:
-                            self.is_down = True
-                            self.movement = "SQUATTING"
-                        elif self.knee_angle > UP_ANGLE:
-                            if self.is_down:
-                                self.reps += 1
-                                self.is_down = False
-                            self.movement = "STANDING"
-                        elif (
-                            self.previous_angle is not None
-                            and self.knee_angle < self.previous_angle
-                        ):
-                            self.movement = "DESCENDING"
-                        else:
-                            self.movement = "RISING"
+                        angle_history.append(angle)
 
-                    # Simple illustrative rules, not medical standards.
-                    # Torso lean is most meaningful during squat movement.
-                    if (
-                        self.torso_angle is not None
-                        and self.movement in (
-                            "SQUATTING", "DESCENDING", "RISING"
-                        )
-                        and self.torso_angle > 40
-                    ):
-                        issues.append(
-                            "Excessive torso lean detected."
+                        smoothed_angle = float(
+                            np.median(angle_history)
                         )
 
-                    if (
-                        self.knee_angle is not None
-                        and self.knee_angle < 40
-                    ):
-                        issues.append(
-                            "Unusually small knee angle detected."
+                        last_state = classify_movement(
+                            smoothed_angle,
+                            exercise
                         )
 
-                    self.score = max(0, 100 - 20 * len(issues))
+                        counter = update_counter(
+                            last_state,
+                            counter,
+                            timestamp_seconds
+                        )
 
-                    if issues:
-                        self.status = "CORRECT YOUR POSTURE"
-                        self.feedback = " ".join(issues)
+                        posture_good, last_feedback = assess_posture(
+                            landmarks,
+                            smoothed_angle,
+                            exercise
+                        )
+
                     else:
-                        self.status = "POSTURE OK"
-                        self.feedback = (
-                            "No configured warning detected. "
-                            "This does not guarantee correct form."
-                        )
+                        last_state = "NOT DETECTED"
+                        last_feedback = "Relevant joints not visible"
 
-                    self.previous_angle = self.knee_angle
+                    if posture_good is True:
+                        correct_frames += 1
+
+                    elif posture_good is False:
+                        incorrect_frames += 1
+
+                    else:
+                        unassessed_frames += 1
+
+                    draw_pose(
+                        frame,
+                        landmarks,
+                        posture_good
+                    )
 
                 else:
-                    self.status = "CORRECT YOUR POSTURE"
-                    self.feedback = (
-                        "Body landmarks are unclear. "
-                        "Move back and keep your hips, knees and ankles visible."
+
+                    last_state = "NOT DETECTED"
+                    last_feedback = "Person not detected"
+
+                    angle_history.clear()
+                    unassessed_frames += 1
+
+                draw_overlay(
+                    frame,
+                    exercise,
+                    counter["reps"],
+                    last_state,
+                    posture_good,
+                    last_feedback
+                )
+
+                writer.write(frame)
+
+                if total_frames > 0:
+
+                    progress.progress(
+                        min(
+                            processed_frames / total_frames,
+                            1.0
+                        )
                     )
 
-            draw_label(
-                output,
-                f"REPS: {self.reps}",
-                35,
-                (80, 255, 120),
-            )
-            draw_label(
-                output,
-                self.status,
-                70,
-                (0, 0, 255)
-                if self.status == "CORRECT YOUR POSTURE"
-                else (80, 255, 120),
-            )
+    finally:
 
-            if self.knee_angle is not None:
-                draw_label(
-                    output,
-                    f"KNEE ANGLE: {self.knee_angle:.1f} deg",
-                    105,
-                )
+        cap.release()
+        writer.release()
 
-            if self.torso_angle is not None:
-                draw_label(
-                    output,
-                    f"TORSO LEAN: {self.torso_angle:.1f} deg",
-                    140,
-                )
+    elapsed = time.perf_counter() - start_time
 
-        except Exception as error:
-            self.status = "CORRECT YOUR POSTURE"
-            self.feedback = f"Camera processing error: {error}"
-            draw_label(output, "PROCESSING ERROR", 40, (0, 0, 255))
+    duration = processed_frames / fps
 
-        return av.VideoFrame.from_ndarray(output, format="bgr24")
+    detection_rate = (
+        100 * visible_frames / processed_frames
+        if processed_frames else 0.0
+    )
 
-    def get_metrics(self):
-        return {
-            "reps": self.reps,
-            "movement": self.movement,
-            "knee_angle": self.knee_angle,
-            "torso_angle": self.torso_angle,
-            "status": self.status,
-            "feedback": self.feedback,
-            "score": self.score,
-            "pose_detected": self.pose_detected,
-        }
+    assessed_frames = correct_frames + incorrect_frames
 
-    def stop(self):
-        if self.landmarker is not None:
-            self.landmarker.close()
-            self.landmarker = None
+    posture_score = (
+        100 * correct_frames / assessed_frames
+        if assessed_frames else 0.0
+    )
+
+    return {
+        "exercise": exercise,
+        "reps": counter["reps"],
+        "frames": processed_frames,
+        "visible": visible_frames,
+        "detection_rate": detection_rate,
+        "duration": duration,
+        "processing_time": elapsed,
+        "last_state": last_state,
+        "correct_frames": correct_frames,
+        "incorrect_frames": incorrect_frames,
+        "unassessed_frames": unassessed_frames,
+        "posture_score": posture_score,
+        "assessed_frames": assessed_frames
+    }
 
 
-# ---------------- USER INTERFACE ----------------
+# =========================================================
+# STREAMLIT DASHBOARD
+# =========================================================
 
-st.title("🏋️ AI Fitness & Posture Assessment")
+st.title("💪 AI Fitness Assessment")
+
 st.write(
-    "Live camera-based squat tracking and rule-based posture feedback."
+    "Upload a recorded exercise video to analyze movement, "
+    "estimate repetitions and visualize body posture."
 )
 
-if not os.path.exists(MODEL_PATH):
+if not MODEL_PATH.exists():
+
     st.error(
-        f"Missing {MODEL_PATH}. Put the model file in this project folder."
+        "Missing pose_landmarker_lite.task. "
+        "Place the model file beside app.py."
     )
+
     st.stop()
 
-st.warning(
-    "Camera access is required. Allow camera permission in your browser. "
-    "Use good lighting and keep your full body visible."
-)
 
 with st.sidebar:
-    st.header("Assessment Settings")
-    st.write("Exercise: **Bodyweight squat**")
-    st.write(f"Squat-down threshold: {DOWN_ANGLE}°")
-    st.write(f"Standing threshold: {UP_ANGLE}°")
-    st.divider()
-    st.caption(
-        "Educational prototype only. The rules are not clinically "
-        "validated and cannot reliably detect every posture error."
+
+    st.header("Workout Settings")
+
+    exercise = st.selectbox(
+        "Choose exercise",
+        EXERCISES
     )
 
-ctx = webrtc_streamer(
-    key="live-fitness-camera",
-    video_processor_factory=FitnessProcessor,
-    media_stream_constraints={
-        "video": True,
-        "audio": False,
-    },
-    async_processing=True,
+    st.info(
+        "Red/green posture assessment is currently "
+        "configured for squats. Other exercises show "
+        "pose tracking without a validated form score."
+    )
+
+
+uploaded = st.file_uploader(
+    "Upload workout video",
+    type=["mp4", "mov", "avi", "mkv"]
 )
 
-st.divider()
-st.subheader("Live Assessment Results")
 
-c1, c2, c3, c4 = st.columns(4)
-rep_box = c1.empty()
-movement_box = c2.empty()
-knee_box = c3.empty()
-score_box = c4.empty()
+if uploaded:
 
-status_box = st.empty()
-feedback_box = st.empty()
-torso_box = st.empty()
+    st.subheader("Original Video")
+    st.video(uploaded)
 
-if ctx.state.playing:
-    @st.fragment(run_every="500ms")
-    def update_dashboard():
-        processor = ctx.video_processor
+    if st.button("Analyze Workout", type="primary"):
 
-        if processor is None:
-            st.info("Starting pose detection...")
-            return
+        progress = st.progress(0)
+        status = st.empty()
 
-        data = processor.get_metrics()
+        suffix = Path(uploaded.name).suffix or ".mp4"
 
-        rep_box.metric("Repetitions", data["reps"])
-        movement_box.metric("Movement", data["movement"])
+        try:
 
-        knee_box.metric(
-            "Knee angle",
-            f'{data["knee_angle"]:.1f}°'
-            if data["knee_angle"] is not None else "N/A",
+            with tempfile.TemporaryDirectory() as temp:
+
+                input_path = Path(temp) / f"input{suffix}"
+
+                output_path = (
+                    Path(temp) / "assessed_video.mp4"
+                )
+
+                input_path.write_bytes(
+                    uploaded.getvalue()
+                )
+
+                status.info("Analyzing your exercise video...")
+
+                report = process_video(
+                    input_path,
+                    output_path,
+                    exercise,
+                    progress
+                )
+
+                video_bytes = output_path.read_bytes()
+
+                if not video_bytes:
+                    raise RuntimeError(
+                        "Processed video is empty."
+                    )
+
+                st.session_state["fitness_report"] = report
+                st.session_state["fitness_video"] = video_bytes
+
+            status.success("Analysis completed successfully!")
+
+        except Exception as exc:
+
+            status.error(
+                f"Analysis failed: {exc}"
+            )
+
+
+# =========================================================
+# ASSESSMENT REPORT
+# =========================================================
+
+if (
+    "fitness_report" in st.session_state
+    and "fitness_video" in st.session_state
+):
+
+    report = st.session_state["fitness_report"]
+
+    video_bytes = st.session_state["fitness_video"]
+
+    st.divider()
+
+    st.header("📊 Assessment Report")
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Estimated Repetitions",
+        report["reps"]
+    )
+
+    c2.metric(
+        "Pose Detection Rate",
+        f'{report["detection_rate"]:.1f}%'
+    )
+
+    duration = int(report["duration"])
+
+    c3.metric(
+        "Video Duration",
+        f"{duration // 60:02d}:{duration % 60:02d}"
+    )
+
+    c4, c5, c6 = st.columns(3)
+
+    c4.metric(
+        "Exercise",
+        report["exercise"]
+    )
+
+    c5.metric(
+        "Frames Processed",
+        report["frames"]
+    )
+
+    c6.metric(
+        "Processing Time",
+        f'{report["processing_time"]:.1f} sec'
+    )
+
+    st.subheader("Posture Assessment")
+
+    if report["exercise"] == "Squats":
+
+        p1, p2, p3 = st.columns(3)
+
+        p1.metric(
+            "Correct Frames",
+            report["correct_frames"]
         )
 
-        score_box.metric("Rule score", f'{data["score"]}/100')
-
-        torso_box.metric(
-            "Torso angle",
-            f'{data["torso_angle"]:.1f}°'
-            if data["torso_angle"] is not None else "N/A",
+        p2.metric(
+            "Incorrect Frames",
+            report["incorrect_frames"]
         )
 
-        if data["status"] == "POSTURE OK":
-            status_box.success("✅ POSTURE OK")
+        p3.metric(
+            "Unassessed Frames",
+            report["unassessed_frames"]
+        )
+
+        if report["assessed_frames"] > 0:
+
+            st.metric(
+                "Basic Posture Score",
+                f'{report["posture_score"]:.1f}%'
+            )
+
+            st.caption(
+                "This score is the percentage of assessed frames "
+                "that passed the implemented squat checks. "
+                "It is not a medical or overall fitness score."
+            )
+
         else:
-            status_box.error("⚠️ CORRECT YOUR POSTURE")
 
-        feedback_box.write(data["feedback"])
+            st.warning(
+                "No frames could be assessed. "
+                "Check that the person's body is visible."
+            )
 
-    update_dashboard()
-else:
-    st.info("Click START in the camera panel above to begin.")
+    else:
+
+        st.info(
+            "Pose tracking is available for this exercise, "
+            "but its red/green posture rules have not yet "
+            "been configured and validated."
+        )
+
+    st.subheader("Movement Feedback")
+
+    if report["detection_rate"] < 70:
+
+        st.warning(
+            "Low pose visibility. Improve lighting and keep "
+            "your body and joints visible."
+        )
+
+    elif report["detection_rate"] < 90:
+
+        st.info(
+            "Moderate pose visibility. Try a clearer video "
+            "with less obstruction."
+        )
+
+    else:
+
+        st.success(
+            "Pose detected in most frames."
+        )
+
+    st.write(
+        f'**Final movement:** {report["last_state"]}'
+    )
+
+    st.write(
+        f'**Pose-visible frames:** '
+        f'{report["visible"]} / {report["frames"]}'
+    )
+
+    st.subheader("Processed Video")
+
+    st.video(video_bytes)
+
+    st.download_button(
+        "Download Assessed Video",
+        data=video_bytes,
+        file_name="assessed_video.mp4",
+        mime="video/mp4"
+    )
+
+    st.caption(
+        "This is a basic computer-vision demonstration. "
+        "Posture checks are approximate and depend on camera "
+        "angle, visibility and threshold calibration."
+    )
